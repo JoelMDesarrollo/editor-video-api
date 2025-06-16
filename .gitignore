@@ -2,3 +2,4 @@ venv
 uploads
 results
 __pycache__
+.env

@@ -1,18 +1,46 @@
 import os
 import re
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
-from moviepy.video.io.VideoFileClip import VideoFileClip
-from moviepy.video.compositing.concatenate import concatenate_videoclips
-from typing import List
 import uuid
 import shutil
+import textwrap
+import requests  # Añadido
+from typing import List
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
+from moviepy.video.io.VideoFileClip import VideoFileClip
+from moviepy.video.compositing.concatenate import concatenate_videoclips
+from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
+from moviepy.video.VideoClip import TextClip
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 
-app = FastAPI(title="Video Merger API", description="API para unir videos")
+# ---------------------------------------------------
+# CONFIGURACIÓN INICIAL
+# ---------------------------------------------------
 
-# Configuración de CORS
+# Cargar variables de entorno
+load_dotenv()
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-85086d8f4aba478a9190eb489d395764")
+DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"  # URL de la API
+
+# ---------------------------------------------------
+# CONFIGURACIÓN FASTAPI
+# ---------------------------------------------------
+
+try:
+    from moviepy.config import change_settings
+    change_settings({"IMAGEMAGICK_BINARY": r"C:\\Program Files\\ImageMagick-7.1.1-Q16-HDRI\\magick.exe"})
+except Exception as e:
+    print(f"Advertencia: Error configurando ImageMagick - {str(e)}")
+
+app = FastAPI(
+    title="Video Merger API con OpenAI",
+    description="API para unir videos con subtítulos generados por IA",
+    version="1.0.0"
+)
+
+# Configuración CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,57 +50,136 @@ app.add_middleware(
     expose_headers=["Content-Disposition"]
 )
 
-# Configuración de directorios
+# ---------------------------------------------------
+# CONFIGURACIÓN DE DIRECTORIOS
+# ---------------------------------------------------
+
 UPLOAD_DIR = "uploads"
 RESULT_DIR = "results"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(RESULT_DIR, exist_ok=True)
 
-# Modelo Pydantic para la solicitud de merge
+# ---------------------------------------------------
+# MODELOS PYDANTIC
+# ---------------------------------------------------
+
 class MergeRequest(BaseModel):
     file_paths: List[str]
+    product_name: str
+
+# ---------------------------------------------------
+# FUNCIONES PRINCIPALES (Actualizadas para OpenAI v1.0+)
+# ---------------------------------------------------
+
+async def generate_product_hooks(product_name: str, num_hooks: int = 3) -> List[str]:
+    """
+    Genera hooks de marketing usando la API de DeepSeek directamente
+    """
+    try:
+        prompt = (
+            f"Genera exactamente {num_hooks} frases promocionales muy cortas (3-5 palabras) "
+            f"para el producto '{product_name}'. Cada frase debe ser llamativa y directa, "
+            "con emojis relevantes. Separa las frases con el caracter '|'. "
+            "Ejemplo: '¡Oferta especial! 🔥|Solo hoy ⏳|No te lo pierdas 🚀'"
+        )
+        
+        headers = {
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 100,
+            "temperature": 0.7
+        }
+        
+        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        hooks = [hook.strip() for hook in content.split("|") if hook.strip()]
+        
+        if not hooks or len(hooks) < num_hooks:
+            hooks = [
+                f"¡{product_name} increíble! 🚀",
+                f"Oferta especial en {product_name} 🔥",
+                f"Compra ahora {product_name} 💯"
+            ]
+            
+        return hooks[:num_hooks]
+    
+    except Exception as e:
+        print(f"Error generando hooks: {str(e)}")
+        return [
+            f"¡Descubre {product_name}! ✨",
+            f"Lo mejor en {product_name.split()[0]} 🏆",
+            f"Oferta limitada ⏳"
+        ]
+
+def create_subtitle_clip(
+    text: str,
+    duration: float,
+    video_size: tuple,
+    fontsize=42,
+    color='white',
+    stroke_color='black',
+    stroke_width=2
+) -> TextClip:
+    """
+    Crea un clip de subtítulo estilo TikTok
+    """
+    wrapped_text = textwrap.fill(text, width=20)
+    
+    return TextClip(
+        txt=wrapped_text,
+        fontsize=fontsize,
+        color=color,
+        font='Arial-Bold',
+        stroke_color=stroke_color,
+        stroke_width=stroke_width,
+        method='caption',
+        align='center',
+        size=(video_size[0] * 0.9, None)
+    ).set_position(('center', 0.15), relative=True).set_duration(duration)
+
+# ---------------------------------------------------
+# ENDPOINTS (Se mantienen igual)
+# ---------------------------------------------------
 
 @app.post("/upload/")
 async def upload_videos(files: List[UploadFile] = File(...)):
-    """Endpoint para subir videos (ahora acepta 1 o más videos)"""
-    if len(files) == 0:
-        raise HTTPException(
-            status_code=400, 
-            detail="Debes subir al menos un video",
-            headers={"Access-Control-Allow-Origin": "*"}
-        )
+    """Sube uno o múltiples archivos de video"""
+    if not files:
+        raise HTTPException(status_code=400, detail="Debes subir al menos un video")
     
     saved_files = []
     for file in files:
-        # Validar que sea un video
         if not file.content_type.startswith('video/'):
-            raise HTTPException(
-                status_code=400, 
-                detail=f"El archivo {file.filename} no es un video",
-                headers={"Access-Control-Allow-Origin": "*"}
-            )
+            raise HTTPException(status_code=400, detail=f"El archivo {file.filename} no es un video válido")
         
-        # Generar nombre único para el archivo
         file_ext = os.path.splitext(file.filename)[1]
         file_name = f"{uuid.uuid4()}{file_ext}"
         file_path = os.path.join(UPLOAD_DIR, file_name)
         
-        # Guardar el archivo
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
         saved_files.append(file_path)
     
-    return {"message": "Videos subidos exitosamente", "files": saved_files}
+    return {
+        "message": "Videos subidos exitosamente",
+        "files": saved_files,
+        "count": len(saved_files)
+    }
 
 @app.post("/merge/")
 async def merge_videos(request: MergeRequest):
-    file_paths = request.file_paths
-    
-    # Verificar y normalizar rutas
+    """Procesa videos con subtítulos generados por OpenAI"""
     normalized_paths = []
-    for path in file_paths:
-        # Convertir rutas relativas a absolutas y normalizar separadores
+    for path in request.file_paths:
         abs_path = os.path.abspath(path.replace('\\', '/'))
         if not os.path.exists(abs_path):
             raise HTTPException(status_code=404, detail=f"Archivo no encontrado: {abs_path}")
@@ -80,97 +187,59 @@ async def merge_videos(request: MergeRequest):
     
     clips = []
     try:
+        hooks = await generate_product_hooks(request.product_name, len(normalized_paths))
         clips = [VideoFileClip(path) for path in normalized_paths]
-        
-        # Asegurar que el directorio results existe
-        os.makedirs(RESULT_DIR, exist_ok=True)
-        
         output_name = f"merged_{uuid.uuid4()}.mp4"
-        output_path = os.path.abspath(os.path.join(RESULT_DIR, output_name))
+        output_path = os.path.join(RESULT_DIR, output_name)
         
         if len(clips) == 1:
-            # Si es solo un video, lo copiamos directamente
-            shutil.copy2(normalized_paths[0], output_path)
+            clip = clips[0]
+            subtitle = create_subtitle_clip(hooks[0], clip.duration, clip.size)
+            final_clip = CompositeVideoClip([clip, subtitle])
         else:
-            # Si son múltiples videos, los concatenamos
-            final_clip = concatenate_videoclips(clips)
-            final_clip.write_videofile(
-                output_path, 
-                codec="libx264", 
-                audio_codec="aac",
-                temp_audiofile="temp-audio.m4a",
-                remove_temp=True
-            )
-            final_clip.close()
+            clips_with_subs = [
+                CompositeVideoClip([clip, create_subtitle_clip(hooks[i % len(hooks)], clip.duration, clip.size)])
+                for i, clip in enumerate(clips)
+            ]
+            final_clip = concatenate_videoclips(clips_with_subs)
         
-        # Retornar solo el nombre del archivo, no la ruta completa
+        final_clip.write_videofile(
+            output_path,
+            codec="libx264",
+            audio_codec="aac",
+            threads=4,
+            preset='ultrafast',
+            ffmpeg_params=['-crf', '22'],
+            logger=None
+        )
+        final_clip.close()
+        
         return {
-            "message": "Video(s) procesado(s) exitosamente",
-            "output_filename": output_name
+            "message": "✅ Videos procesados exitosamente",
+            "output_filename": output_name,
+            "hooks_used": hooks,
+            "video_duration": sum(c.duration for c in clips)
         }
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al procesar videos: {str(e)}")
-    finally:
-        # Cerrar clips solo si fueron creados exitosamente
-        for clip in clips:
-            if clip:
-                try:
-                    clip.close()
-                except:
-                    pass
-
-@app.get("/download/{filename}")
-async def download_video(filename: str, request: Request):
-    """Endpoint corregido para descargar videos"""
-    try:
-        # Seguridad: validar el nombre del archivo
-        if not re.match(r'^merged_[a-f0-9-]+\.mp4$', filename):
-            raise HTTPException(status_code=400, detail="Nombre de archivo inválido")
-        
-        file_path = os.path.join(RESULT_DIR, filename)
-        
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="Archivo no encontrado")
-        
-        # Determinar el tipo de respuesta basado en el encabezado Accept
-        accept_header = request.headers.get("Accept", "")
-        
-        if "application/json" in accept_header:
-            return JSONResponse({
-                "url": f"{str(request.base_url)}download/{filename}",
-                "filename": filename,
-                "size": os.path.getsize(file_path)
-            })
-        else:
-            # Retornar el archivo directamente
-            return FileResponse(
-                path=file_path,
-                media_type="video/mp4",
-                filename=filename,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Expose-Headers": "Content-Disposition",
-                    "Content-Disposition": f"attachment; filename={filename}",
-                    "Cross-Origin-Resource-Policy": "cross-origin",
-                    "Cache-Control": "public, max-age=3600"
-                }
-            )
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al servir archivo: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error al procesar videos: {str(e)}")
+    finally:
+        for clip in clips:
+            try:
+                if clip:
+                    clip.close()
+            except:
+                pass
 
-@app.get("/stream/{filename}")
-async def stream_video(filename: str, request: Request):
-    """Endpoint adicional para streaming de video (para visualización)"""
+@app.get("/download/{filename}")
+async def download_video(filename: str):
     try:
-        # Seguridad: validar el nombre del archivo
         if not re.match(r'^merged_[a-f0-9-]+\.mp4$', filename):
             raise HTTPException(status_code=400, detail="Nombre de archivo inválido")
         
         file_path = os.path.join(RESULT_DIR, filename)
-        
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="Archivo no encontrado")
         
@@ -180,21 +249,16 @@ async def stream_video(filename: str, request: Request):
             filename=filename,
             headers={
                 "Access-Control-Allow-Origin": "*",
-                "Accept-Ranges": "bytes",
-                "Content-Disposition": f"inline; filename={filename}",
-                "Cross-Origin-Resource-Policy": "cross-origin",
-                "Cache-Control": "public, max-age=3600"
+                "Content-Disposition": f"attachment; filename={filename}"
             }
         )
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al servir archivo: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error al descargar: {str(e)}")
 
 @app.get("/clean/")
 async def clean_directories():
-    """Endpoint para limpiar los directorios (opcional, para desarrollo)"""
     try:
+        deleted_files = 0
         for folder in [UPLOAD_DIR, RESULT_DIR]:
             if os.path.exists(folder):
                 for filename in os.listdir(folder):
@@ -202,37 +266,29 @@ async def clean_directories():
                     try:
                         if os.path.isfile(file_path):
                             os.unlink(file_path)
+                            deleted_files += 1
                     except Exception as e:
                         print(f"Error eliminando {file_path}: {str(e)}")
         
-        return {"message": "Directorios limpiados exitosamente"}
+        return {
+            "message": "Directorios limpiados",
+            "deleted_files": deleted_files
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al limpiar: {str(e)}")
 
-@app.get("/list-uploads/")
-async def list_uploaded_videos():
-    """Endpoint para listar los videos subidos"""
-    try:
-        if not os.path.exists(UPLOAD_DIR):
-            return {"files": []}
-        
-        files = []
-        for f in os.listdir(UPLOAD_DIR):
-            file_path = os.path.join(UPLOAD_DIR, f)
-            if os.path.isfile(file_path):
-                files.append(file_path)
-        
-        return {"files": files}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listando archivos: {str(e)}")
-
-@app.get("/test-cors")
-async def test_cors():
-    return {"message": "CORS está funcionando!"}
-
-@app.get("/")
-async def root():
-    return {"message": "Video Merger API funcionando correctamente"}
+# @app.get("/")
+# async def root():
+#     return {
+#         "message": "🚀 Video Merger API con OpenAI funcionando",
+#         "endpoints": {
+#             "upload": "POST /upload/ - Subir videos",
+#             "merge": "POST /merge/ - Procesar videos",
+#             "download": "GET /download/{filename} - Descargar video",
+#             "clean": "GET /clean/ - Limpiar temporales"
+#         },
+#         "openai_status": "activo" if OPENAI_API_KEY else "no configurado"
+#     }
 
 if __name__ == "__main__":
     import uvicorn
