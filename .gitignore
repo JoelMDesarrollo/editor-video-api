@@ -1,5 +1,6 @@
 venv
 uploads
 results
+thumbnails
 __pycache__
 .env

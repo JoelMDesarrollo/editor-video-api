@@ -1,9 +1,21 @@
+# Core API
 fastapi==0.109.0
 uvicorn==0.27.0
-moviepy==1.0.3
-python-dotenv==1.0.0
 python-multipart==0.0.6
 pydantic==2.5.2
+
+# Video processing
+moviepy==1.0.3
 imageio==2.31.1
 imageio-ffmpeg==0.4.8
+
+# Utilities
+python-dotenv==1.0.0
 requests==2.31.0
+
+# Optional: Para logging mejorado y monitoreo
+# rich==13.7.0  # Para logs coloridos
+# psutil==5.9.8  # Para monitoreo de recursos
+
+# Nota: Ollama no requiere dependencias adicionales de Python
+# Solo necesitas tener Ollama instalado en tu sistema
