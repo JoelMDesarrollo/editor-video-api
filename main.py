@@ -2,15 +2,16 @@ import os
 import re
 import uuid
 import shutil
-import textwrap
 import requests
-import asyncio
-from typing import List, Optional
 import logging
+import random
+
 from datetime import datetime
 from pathlib import Path
+from typing import List, Dict
+from typing import Optional
 
-from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, status, Query
+from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, status, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,27 +21,27 @@ from dotenv import load_dotenv
 
 from moviepy.editor import VideoFileClip, concatenate_videoclips, CompositeVideoClip, TextClip
 from PIL import Image
-import io
 
 # ---------------------------------------------------
-# CONFIGURACIÓN DE LOGGING
+# CONFIGURACIÓN INICIAL
 # ---------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------
-# CARGA DE VARIABLES DE ENTORNO
-# ---------------------------------------------------
 load_dotenv()
 
 # Configuración de MoviePy
 from moviepy.config import change_settings
-change_settings({"IMAGEMAGICK_BINARY": r"C:\Program Files\ImageMagick-7.1.1-Q16-HDRI\magick.exe"})
+change_settings({
+    "IMAGEMAGICK_BINARY": r"C:\Program Files\ImageMagick-7.1.1-Q16-HDRI\magick.exe",
+    "FFMPEG_BINARY": "ffmpeg",
+    "OPTIMIZE": True
+})
 
 # Configuración de la API
 API_KEY = os.getenv("API_KEY", "your-default-api-key")
 if not API_KEY:
-    raise RuntimeError("Falta definir API_KEY en .env")
+    raise RuntimeError("API_KEY no definida en .env")
 
 # Configuración para IA local
 AI_PROVIDER = os.getenv("AI_PROVIDER", "ollama")
@@ -63,7 +64,7 @@ os.makedirs(THUMBNAIL_DIR, exist_ok=True)
 class MergeRequest(BaseModel):
     file_paths: List[str]
     product_name: str
-    combinations: int = 1  # Número de combinaciones diferentes a generar
+    combinations: int = 1
 
 class UploadResponse(BaseModel):
     message: str
@@ -75,6 +76,7 @@ class VideoFile(BaseModel):
     path: str
     size: int
     created_at: str
+
 class Combination(BaseModel):
     video_url: str
     thumbnail: str
@@ -93,13 +95,29 @@ class ProjectResponse(BaseModel):
     merged_filename: str
     video_url: str
     combinations: List[Combination]
+
+class ProjectStatus(BaseModel):
+    project_id: str
+    status: str
+    progress: int
+    message: str
+    error: Optional[str] = None  # Campo opcional con valor por defecto
+    result: Optional[dict] = None  # Campo opcional con valor por defecto
+
+# ---------------------------------------------------
+# ALMACENAMIENTO DE ESTADO
+# ---------------------------------------------------
+project_states = {}
+
 # ---------------------------------------------------
 # CONFIGURACIÓN FASTAPI
 # ---------------------------------------------------
 app = FastAPI(
     title="Video Merger API",
     description="API para unir videos con subtítulos generados por IA",
-    version="3.0.0"
+    version="3.0.0",
+    redirect_slashes=False,
+    max_upload_size=100 * 1024 * 1024  # 100MB
 )
 
 app.add_middleware(
@@ -131,6 +149,27 @@ def api_key_auth(x_api_key: str = Depends(X_API_KEY)):
 # ---------------------------------------------------
 # FUNCIONES AUXILIARES
 # ---------------------------------------------------
+def update_project_state(project_id: str, status: str, progress: int, message: str, error: str = None, result: dict = None):
+    if project_id not in project_states:
+        project_states[project_id] = {
+            "status": status,
+            "progress": progress,
+            "message": message,
+            "error": error,
+            "result": result,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now()
+        }
+    else:
+        project_states[project_id].update({
+            "status": status,
+            "progress": progress,
+            "message": message,
+            "error": error,
+            "result": result,
+            "updated_at": datetime.now()
+        })
+
 def generate_fallback_hooks(product_name: str, num_hooks: int = 3) -> List[str]:
     templates = [
         f"¿Conoces otros beneficios de {product_name} aparte de su 20% de descuento esta semana?",
@@ -141,7 +180,6 @@ def generate_fallback_hooks(product_name: str, num_hooks: int = 3) -> List[str]:
         f"La forma inteligente de usar {product_name} para resultados visibles",
         f"{product_name} de calidad premium - ¿Por qué esperar para probarlo?"
     ]
-    import random
     return random.sample(templates, min(num_hooks, len(templates)))
 
 async def generate_product_hooks(product_name: str, num_hooks: int = 3) -> List[str]:
@@ -151,19 +189,7 @@ async def generate_product_hooks(product_name: str, num_hooks: int = 3) -> List[
                 f"{OLLAMA_URL}/api/generate",
                 json={
                     "model": OLLAMA_MODEL,
-                    "prompt": f"""Genera {num_hooks} frases promocionales descriptivas para '{product_name}' que:
-1. Resalten beneficios específicos del producto
-2. Incluyan porcentajes de descuento cuando sea apropiado
-3. Usen lenguaje persuasivo
-4. Sean preguntas o afirmaciones impactantes
-5. Tengan entre 10-15 palabras máximo
-
-Ejemplos:
-- ¿Conoces otros beneficios del polen de abeja aparte de su 20% de descuento esta semana?
-- 5 láminas que añaden 10 puntos de aura a tu habitación al instante.
-- Arte que hace que tu pared se sienta como la energía de un protagonista.
-
-Formato: frase1|frase2|frase3""",
+                    "prompt": f"Genera {num_hooks} frases promocionales para '{product_name}'",
                     "stream": False,
                     "options": {"temperature": 0.7}
                 },
@@ -180,24 +206,19 @@ Formato: frase1|frase2|frase3""",
 
 def create_subtitle_clip(text: str, duration: float, video_size: tuple) -> TextClip:
     try:
-        # No envolvemos el texto para mantener la frase completa
         txt_clip = TextClip(
             text,
-            fontsize=36,  # Un poco más pequeño para frases más largas
+            fontsize=36,
             color='white',
             font='Arial-Bold',
             stroke_color='black',
             stroke_width=2,
             method='caption',
             align='center',
-            size=(video_size[0] * 0.9, None)  # Usamos 90% del ancho
-        )
+            size=(video_size[0] * 0.9, None))
         
-        # Posicionamos en el 25% desde arriba (75% superior)
         txt_clip = txt_clip.set_position(('center', 0.25), relative=True)
         txt_clip = txt_clip.set_duration(duration)
-        
-        # Añadimos margen inferior para mejor legibilidad
         txt_clip = txt_clip.margin(bottom=20, opacity=0)
         
         return txt_clip
@@ -222,42 +243,39 @@ def generate_unique_filename(product_name: str) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"{clean_name}_{timestamp}.mp4"
 
-def get_video_metadata(file_path: str) -> dict:
-    try:
-        clip = VideoFileClip(file_path)
-        duration = clip.duration
-        width, height = clip.size
-        clip.close()
-        return {
-            "duration": duration,
-            "resolution": f"{width}x{height}",
-            "size": os.path.getsize(file_path)
-        }
-    except Exception as e:
-        logger.error(f"Error obteniendo metadata: {str(e)}")
-        return {}
-
 # ---------------------------------------------------
 # ENDPOINTS
 # ---------------------------------------------------
-@app.post("/upload/", response_model=UploadResponse, dependencies=[Depends(api_key_auth)])
+@app.post("/upload", response_model=UploadResponse, dependencies=[Depends(api_key_auth)])
 async def upload_videos(files: List[UploadFile] = File(...)):
     saved_files = []
     
     for file in files:
-        if not file.content_type or not file.content_type.startswith("video/"):
+        if not file.content_type.startswith("video/"):
             raise HTTPException(400, f"{file.filename} no es un video válido")
         
-        ext = os.path.splitext(file.filename)[1]
-        unique_name = f"{uuid.uuid4()}{ext}"
-        file_path = os.path.join(UPLOAD_DIR, unique_name)
-        
+        # Guardar temporalmente para validar
+        temp_path = f"temp_{file.filename}"
         try:
-            with open(file_path, "wb") as buffer:
+            with open(temp_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
-            saved_files.append(file_path)
+            
+            # Validar integridad del video
+            try:
+                clip = VideoFileClip(temp_path)
+                clip.close()
+            except Exception as e:
+                raise HTTPException(400, f"Video corrupto: {file.filename}")
+            
+            # Mover al directorio final
+            unique_name = f"{uuid.uuid4()}.mp4"
+            final_path = os.path.join(UPLOAD_DIR, unique_name)
+            shutil.move(temp_path, final_path)
+            saved_files.append(unique_name)
+            
         except Exception as e:
-            logger.error(f"Error guardando {file.filename}: {str(e)}")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
             raise HTTPException(500, f"Error guardando {file.filename}")
     
     return {
@@ -266,107 +284,398 @@ async def upload_videos(files: List[UploadFile] = File(...)):
         "count": len(saved_files)
     }
 
-@app.post("/merge/", response_model=List[ProjectResponse], dependencies=[Depends(api_key_auth)])
-async def merge_videos(req: MergeRequest):
-    if not 1 <= req.combinations <= 10:
-        raise HTTPException(400, "El número de combinaciones debe estar entre 1 y 10")
+@app.post("/merge", response_model=ProjectStatus, dependencies=[Depends(api_key_auth)])
+async def merge_videos(req: MergeRequest, background_tasks: BackgroundTasks):
+    """Endpoint para iniciar el proceso de mezcla de videos"""
+    if len(req.file_paths) < 2:
+        raise HTTPException(400, "Se necesitan al menos 2 videos para combinaciones")
     
-    normalized_paths = []
-    for path in req.file_paths:
-        normalized_path = os.path.abspath(path.replace("\\", "/"))
-        if not os.path.exists(normalized_path):
-            raise HTTPException(404, f"Archivo no encontrado: {path}")
-        normalized_paths.append(normalized_path)
-    
-    hooks = await generate_product_hooks(req.product_name, len(normalized_paths))
-    results = []
     project_id = str(uuid.uuid4())
-    base_filename = generate_unique_filename(req.product_name).replace(".mp4", "")
     
-    combinations = []
+    # Iniciar estado del proyecto
+    update_project_state(project_id, "queued", 0, "Proyecto en cola para procesamiento")
     
-    for combo in range(req.combinations):
-        try:
-            # Mezclar los videos para crear combinaciones diferentes
-            import random
-            if combo > 0:
-                random.shuffle(normalized_paths)
-            
-            video_clips = []
-            for i, path in enumerate(normalized_paths):
-                clip = VideoFileClip(path)
-                hook_index = i % len(hooks)
-                subtitle_clip = create_subtitle_clip(hooks[hook_index], clip.duration, clip.size)
-                composite_clip = CompositeVideoClip([clip, subtitle_clip])
-                video_clips.append(composite_clip)
-            
-            final_clip = concatenate_videoclips(video_clips) if len(video_clips) > 1 else video_clips[0]
-            
-            output_filename = f"{base_filename}_{combo+1}.mp4"
-            output_path = os.path.join(RESULT_DIR, output_filename)
-            
-            final_clip.write_videofile(
-                output_path,
-                codec="libx264",
-                audio_codec="aac",
-                threads=4,
-                preset="medium",
-                ffmpeg_params=["-crf", "20"]
-            )
-            
-            # Generar thumbnail
-            thumbnail_filename = f"{base_filename}_{combo+1}.jpg"
-            thumbnail_path = os.path.join(THUMBNAIL_DIR, thumbnail_filename)
-            generate_thumbnail(output_path, thumbnail_path)
-            
-            combinations.append({
-                "video_url": f"/static/videos/{output_filename}",
-                "thumbnail": f"/static/thumbnails/{thumbnail_filename}"
-            })
-            
-        except Exception as e:
-            logger.error(f"Error en combinación {combo+1}: {str(e)}")
-            continue
-        finally:
-            for clip in video_clips:
-                clip.close()
+    # Procesar en segundo plano
+    background_tasks.add_task(
+        process_all_videos_combinations, 
+        req.file_paths, 
+        req.product_name, 
+        req.combinations,
+        project_id
+    )
     
-    if not combinations:
-        raise HTTPException(500, "Error al generar todas las combinaciones")
-    
-    # Creamos un solo proyecto con todas las combinaciones
-    main_filename = f"{base_filename}_1.mp4"
-    main_thumbnail = f"{base_filename}_1.jpg"
-    
-    results.append({
-        "id": project_id,
-        "name": f"Video de {req.product_name}",
-        "product": req.product_name,
-        "status": "Published",
-        "views": "0",
-        "engagement": "0%",
-        "videos": len(normalized_paths),
-        "thumbnail": f"/static/thumbnails/{main_thumbnail}",
-        "created_at": datetime.now().isoformat(),
-        "last_updated": "Recently",
-        "merged_filename": main_filename,
-        "video_url": f"/static/videos/{main_filename}",
-        "combinations": combinations
-    })
-    
-    return results
+    return {
+        "project_id": project_id,
+        "status": "queued",
+        "progress": 0,
+        "message": "Proyecto creado y en cola para procesamiento",
+        "error": None,
+        "result": None
+    }
 
-@app.get("/projects/", response_model=List[ProjectResponse], dependencies=[Depends(api_key_auth)])
+async def process_all_videos_combinations(file_paths: List[str], product_name: str, combinations: int, project_id: str):
+    """Procesa combinaciones que incluyen todos los videos en diferentes órdenes"""
+    try:
+        update_project_state(project_id, "validating", 5, "Validando archivos...")
+
+        # Normaliza rutas y verifica archivos
+        normalized_paths = []
+        for path in file_paths:
+            if path.startswith('uploads/'):
+                path = path[8:]
+            full_path = os.path.join(UPLOAD_DIR, path)
+            if not os.path.exists(full_path):
+                logger.error(f"Archivo no encontrado: {full_path}")
+                continue
+            normalized_paths.append(full_path)
+
+        if len(normalized_paths) < 2:
+            raise Exception("Se necesitan al menos 2 videos válidos para combinaciones")
+
+        # Genera hooks promocionales (uno para cada video)
+        hooks = await generate_product_hooks(product_name, len(normalized_paths))
+        base_filename = generate_unique_filename(product_name).replace(".mp4", "")
+        results = []
+        used_orders = []
+
+        # Generar órdenes únicos para las combinaciones
+        for combo_num in range(combinations):
+            try:
+                progress = 20 + (combo_num * 70 // combinations)
+                
+                # Generar un orden único que no se haya usado antes
+                while True:
+                    if combo_num == 0:
+                        # Primera combinación siempre en orden original
+                        video_order = list(range(len(normalized_paths)))
+                        break
+                    else:
+                        video_order = random.sample(range(len(normalized_paths)), len(normalized_paths))
+                        if video_order not in used_orders:
+                            break
+                
+                used_orders.append(video_order)
+                update_msg = f"Procesando combinación {combo_num+1}/{combinations} (orden: {[x+1 for x in video_order]})"
+                update_project_state(
+                    project_id,
+                    "processing",
+                    progress,
+                    update_msg
+                )
+
+                # Procesar todos los videos en el orden generado
+                video_clips = []
+                for i, video_idx in enumerate(video_order):
+                    clip = VideoFileClip(normalized_paths[video_idx])
+                    subtitle = create_subtitle_clip(
+                        hooks[i % len(hooks)],
+                        clip.duration,
+                        clip.size
+                    )
+                    composite = CompositeVideoClip([clip, subtitle])
+                    video_clips.append(composite)
+                
+                # Concatenar todos los videos
+                final_clip = concatenate_videoclips(video_clips)
+                
+                # Nombre del archivo
+                output_filename = f"{base_filename}_combo{combo_num+1}.mp4"
+                output_path = os.path.join(RESULT_DIR, output_filename)
+                
+                final_clip.write_videofile(
+                    output_path,
+                    codec="libx264",
+                    audio_codec="aac",
+                    threads=4,
+                    preset="slow",
+                    ffmpeg_params=["-crf", "18"],
+                    verbose=False
+                )
+
+                # Generar thumbnail
+                thumbnail_filename = f"{base_filename}_combo{combo_num+1}.jpg"
+                thumbnail_path = os.path.join(THUMBNAIL_DIR, thumbnail_filename)
+                generate_thumbnail(output_path, thumbnail_path)
+                
+                results.append({
+                    "filename": output_filename,
+                    "thumbnail": thumbnail_filename,
+                    "order": [x+1 for x in video_order]  # Para referencia
+                })
+
+                # Liberar recursos
+                for clip in video_clips:
+                    clip.close()
+                final_clip.close()
+
+            except Exception as e:
+                logger.error(f"Error en combinación {combo_num+1}: {str(e)}")
+                continue
+
+        update_project_state(
+            project_id,
+            "completed",
+            100,
+            f"Generadas {len(results)} combinaciones con todos los videos",
+            result={
+                "output_files": [item["filename"] for item in results],
+                "thumbnails": [item["thumbnail"] for item in results],
+                "details": results
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error crítico: {str(e)}")
+        update_project_state(
+            project_id,
+            "error",
+            0,
+            "Falló la generación de combinaciones",
+            error=str(e)
+        )
+        
+async def process_combinations(file_paths: List[str], product_name: str, combinations: int, project_id: str):
+    """Procesa combinaciones de videos según el número solicitado"""
+    try:
+        update_project_state(project_id, "validating", 5, "Validando archivos...")
+
+        # Normaliza rutas y verifica archivos
+        normalized_paths = []
+        for path in file_paths:
+            if path.startswith('uploads/'):
+                path = path[8:]
+            full_path = os.path.join(UPLOAD_DIR, path)
+            if not os.path.exists(full_path):
+                logger.error(f"Archivo no encontrado: {full_path}")
+                continue
+            normalized_paths.append(full_path)
+
+        if len(normalized_paths) < 2:
+            raise Exception("Se necesitan al menos 2 videos válidos para combinaciones")
+
+        # Genera hooks promocionales (el doble de los necesarios)
+        hooks = await generate_product_hooks(product_name, len(normalized_paths)*2)
+        base_filename = generate_unique_filename(product_name).replace(".mp4", "")
+        results = []
+        used_combinations = set()
+
+        # 1. Primero generamos todas las combinaciones secuenciales posibles
+        sequential_combinations = []
+        for i in range(len(normalized_paths)-1):
+            seq_combo = (i, i+1)
+            sequential_combinations.append(seq_combo)
+            used_combinations.add(seq_combo)
+
+        # 2. Generamos las combinaciones solicitadas
+        for combo_num in range(combinations):
+            try:
+                progress = 20 + (combo_num * 70 // combinations)
+                
+                # Si hay combinaciones secuenciales disponibles, las usamos primero
+                if combo_num < len(sequential_combinations):
+                    i, j = sequential_combinations[combo_num]
+                    combo_type = "secuencial"
+                    update_msg = f"Procesando combinación {combo_num+1}/{combinations} ({combo_type}: video {i+1}+{j+1})"
+                else:
+                    # Generamos combinaciones aleatorias únicas
+                    while True:
+                        i, j = random.sample(range(len(normalized_paths)), 2)
+                        if (i, j) not in used_combinations and i != j:
+                            used_combinations.add((i, j))
+                            break
+                    combo_type = "aleatoria"
+                    update_msg = f"Procesando combinación {combo_num+1}/{combinations} ({combo_type}: video {i+1}+{j+1})"
+
+                update_project_state(
+                    project_id,
+                    "processing",
+                    progress,
+                    update_msg
+                )
+
+                # Procesamos los dos videos seleccionados
+                clip1 = VideoFileClip(normalized_paths[i])
+                clip2 = VideoFileClip(normalized_paths[j])
+                
+                # Subtítulos diferentes para cada video
+                subtitle1 = create_subtitle_clip(
+                    f"Beneficio clave {combo_num+1}",
+                    clip1.duration,
+                    clip1.size
+                )
+                subtitle2 = create_subtitle_clip(
+                    hooks[combo_num % len(hooks)],
+                    clip2.duration,
+                    clip2.size
+                )
+                
+                composite1 = CompositeVideoClip([clip1, subtitle1])
+                composite2 = CompositeVideoClip([clip2, subtitle2])
+                final_clip = concatenate_videoclips([composite1, composite2])
+                
+                # Nombre del archivo basado en el tipo de combinación
+                output_filename = f"{base_filename}_{combo_type[:3]}{combo_num+1}.mp4"
+                output_path = os.path.join(RESULT_DIR, output_filename)
+                
+                final_clip.write_videofile(
+                    output_path,
+                    codec="libx264",
+                    audio_codec="aac",
+                    threads=4,
+                    preset="slow",
+                    ffmpeg_params=["-crf", "18"],
+                    verbose=False
+                )
+
+                # Generar thumbnail
+                thumbnail_filename = f"{base_filename}_{combo_type[:3]}{combo_num+1}.jpg"
+                thumbnail_path = os.path.join(THUMBNAIL_DIR, thumbnail_filename)
+                generate_thumbnail(output_path, thumbnail_path)
+                
+                results.append({
+                    "filename": output_filename,
+                    "thumbnail": thumbnail_filename,
+                    "type": combo_type,
+                    "videos": [i+1, j+1]
+                })
+
+                # Liberar recursos
+                composite1.close()
+                composite2.close()
+                final_clip.close()
+                clip1.close()
+                clip2.close()
+
+            except Exception as e:
+                logger.error(f"Error en combinación {combo_num+1}: {str(e)}")
+                continue
+
+        update_project_state(
+            project_id,
+            "completed",
+            100,
+            f"Generadas {len(results)} combinaciones solicitadas",
+            result={
+                "output_files": [item["filename"] for item in results],
+                "thumbnails": [item["thumbnail"] for item in results],
+                "details": results
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error crítico: {str(e)}")
+        update_project_state(
+            project_id,
+            "error",
+            0,
+            "Falló la generación de combinaciones",
+            error=str(e)
+        )
+
+async def process_videos_background(file_paths: List[str], product_name: str, combinations: int, project_id: str):
+    try:
+        update_project_state(project_id, "validating", 5, "Validando archivos...")
+        
+        hooks = await generate_product_hooks(product_name, len(file_paths))
+        base_filename = generate_unique_filename(product_name).replace(".mp4", "")
+        
+        for combo in range(combinations):
+            try:
+                combo_progress = 20 + (combo * 70 // combinations)
+                update_project_state(
+                    project_id,
+                    "processing",
+                    combo_progress,
+                    f"Procesando combinación {combo + 1}/{combinations}"
+                )
+                
+                if combo > 0:
+                    import random
+                    random.shuffle(file_paths)
+                
+                video_clips = []
+                for i, path in enumerate(file_paths):
+                    clip = VideoFileClip(path)
+                    subtitle_clip = create_subtitle_clip(hooks[i % len(hooks)], clip.duration, clip.size)
+                    composite_clip = CompositeVideoClip([clip, subtitle_clip])
+                    video_clips.append(composite_clip)
+                
+                final_clip = concatenate_videoclips(video_clips) if len(video_clips) > 1 else video_clips[0]
+                
+                output_filename = f"{base_filename}_{combo+1}.mp4"
+                output_path = os.path.join(RESULT_DIR, output_filename)
+                
+                final_clip.write_videofile(
+                    output_path,
+                    codec="libx264",
+                    audio_codec="aac",
+                    threads=4,
+                    preset="slow",
+                    ffmpeg_params=["-crf", "18", "-pix_fmt", "yuv420p"],
+                    verbose=False,
+                    logger=None
+                )
+                
+                thumbnail_filename = f"{base_filename}_{combo+1}.jpg"
+                thumbnail_path = os.path.join(THUMBNAIL_DIR, thumbnail_filename)
+                generate_thumbnail(output_path, thumbnail_path)
+                
+                # Cerrar clips para liberar memoria
+                for clip in video_clips:
+                    clip.close()
+                final_clip.close()
+                
+            except Exception as e:
+                logger.error(f"Error en combinación {combo+1}: {str(e)}")
+                continue
+        
+        update_project_state(
+            project_id, 
+            "completed", 
+            100, 
+            "¡Proyecto completado exitosamente!",
+            result={
+                "project_id": project_id,
+                "product_name": product_name,
+                "combinations": combinations,
+                "created_at": datetime.now().isoformat()
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error general en el procesamiento: {str(e)}")
+        update_project_state(
+            project_id,
+            "error",
+            0,
+            "Error en el procesamiento",
+            error=str(e)
+        )
+
+@app.get("/project/{project_id}/status", response_model=ProjectStatus)
+async def get_project_status(project_id: str):
+    if project_id not in project_states:
+        raise HTTPException(404, "Proyecto no encontrado")
+    
+    state = project_states[project_id]
+    return {
+        "project_id": project_id,
+        "status": state["status"],
+        "progress": state["progress"],
+        "message": state["message"],
+        "error": state.get("error"),
+        "result": state.get("result")
+    }
+
+@app.get("/projects", response_model=List[ProjectResponse], dependencies=[Depends(api_key_auth)])
 async def list_projects():
     projects = {}
     
-    # Primero agrupamos todos los archivos por proyecto base
     for filename in os.listdir(RESULT_DIR):
         if filename.endswith(".mp4"):
             try:
-                # Extraemos el nombre base (sin _X.mp4)
                 base_name = re.sub(r'_\d+\.mp4$', '', filename)
-                project_key = base_name.split('_')[:-2]  # Eliminamos fecha/hora
+                project_key = base_name.split('_')[:-2]
                 project_key = '_'.join(project_key)
                 
                 if project_key not in projects:
@@ -390,10 +699,8 @@ async def list_projects():
             except Exception as e:
                 logger.error(f"Error procesando {filename}: {str(e)}")
     
-    # Ahora construimos la respuesta
     response = []
     for project_key, data in projects.items():
-        # Ordenamos los archivos por fecha de creación
         sorted_files = sorted(data["files"], key=lambda x: x["created_at"])
         
         combinations = []
@@ -404,7 +711,6 @@ async def list_projects():
                 "thumbnail": f"/static/thumbnails/{base_name}.jpg"
             })
         
-        # Usamos el primer archivo como principal
         main_file = sorted_files[0]
         base_name = main_file["filename"].replace(".mp4", "")
         
@@ -415,7 +721,7 @@ async def list_projects():
             "status": "Published",
             "views": "0",
             "engagement": "0%",
-            "videos": len(combinations),  # Número de combinaciones
+            "videos": len(combinations),
             "thumbnail": f"/static/thumbnails/{base_name}.jpg",
             "created_at": data["created_at"].isoformat(),
             "last_updated": "Recently",
@@ -426,22 +732,40 @@ async def list_projects():
     
     return sorted(response, key=lambda x: x["created_at"], reverse=True)
 
-@app.get("/uploads/", response_model=List[VideoFile], dependencies=[Depends(api_key_auth)])
+@app.get("/uploads", response_model=List[VideoFile], dependencies=[Depends(api_key_auth)])
 async def list_uploads():
     uploads = []
     
     for filename in os.listdir(UPLOAD_DIR):
         file_path = os.path.join(UPLOAD_DIR, filename)
         if os.path.isfile(file_path):
-            created_at = datetime.fromtimestamp(os.path.getctime(file_path))
+            stat = os.stat(file_path)
+            created_at = datetime.fromtimestamp(stat.st_ctime)
             uploads.append({
                 "filename": filename,
                 "path": f"/static/uploads/{filename}",
-                "size": os.path.getsize(file_path),
+                "size": stat.st_size,
                 "created_at": created_at.isoformat()
             })
     
     return sorted(uploads, key=lambda x: x["created_at"], reverse=True)
+
+@app.delete("/uploads/{filename}", dependencies=[Depends(api_key_auth)])
+async def delete_uploaded_video(filename: str):
+    if not re.match(r"^[a-f0-9]{8}-([a-f0-9]{4}-){3}[a-f0-9]{12}\.\w+$", filename):
+        raise HTTPException(status_code=400, detail="Nombre de archivo inválido")
+    
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Video no encontrado")
+    
+    try:
+        os.remove(file_path)
+        return {"message": f"Video {filename} eliminado correctamente"}
+    except Exception as e:
+        logger.error(f"Error eliminando {filename}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error eliminando el video: {str(e)}")
 
 @app.get("/download/{filename}", dependencies=[Depends(api_key_auth)])
 async def download_video(filename: str):
@@ -460,20 +784,63 @@ async def download_video(filename: str):
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
-@app.get("/health/")
+@app.get("/health")
 async def health_check():
     return {
-        "status": "healthy",
-        "api_version": "3.0.0",
-        "storage": {
-            "uploads": len(os.listdir(UPLOAD_DIR)),
-            "results": len(os.listdir(RESULT_DIR))
-        }
+        "status": "ok", 
+        "active_projects": len(project_states)
     }
 
-# Generar thumbnails al iniciar
+@app.get("/media/videos/{filename}")
+async def serve_video(filename: str):
+    video_path = Path(f"results/{filename}")
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    return FileResponse(
+        video_path,
+        media_type="video/mp4",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+            "Content-Disposition": f'inline; filename="{filename}"'
+        }
+    )
+
+@app.get("/media/uploads/{filename}")
+async def serve_upload(filename: str):
+    video_path = Path(f"uploads/{filename}")
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    return FileResponse(
+        video_path,
+        media_type="video/mp4",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+            "Content-Disposition": f'inline; filename="{filename}"'
+        }
+    )
+
+@app.get("/media/thumbnails/{filename}")
+async def serve_thumbnail(filename: str):
+    thumbnail_path = Path(f"thumbnails/{filename}")
+    if not thumbnail_path.exists():
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+    
+    return FileResponse(
+        thumbnail_path,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": f'inline; filename="{filename}"'
+        }
+    )
+
 @app.on_event("startup")
 async def startup_event():
+    logger.info("Iniciando servidor de Video Merger API...")
     logger.info("Generando thumbnails para videos existentes...")
     for filename in os.listdir(RESULT_DIR):
         if filename.endswith(".mp4"):
@@ -483,10 +850,8 @@ async def startup_event():
                     os.path.join(RESULT_DIR, filename),
                     thumbnail_path
                 )
+    logger.info("Servidor iniciado correctamente")
 
-# ---------------------------------------------------
-# RUN
-# ---------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
