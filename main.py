@@ -39,14 +39,16 @@ change_settings({
 })
 
 # Configuración de la API
-API_KEY = os.getenv("API_KEY", "your-default-api-key")
+API_KEY = os.getenv("API_KEY", "12345678")
 if not API_KEY:
     raise RuntimeError("API_KEY no definida en .env")
 
-# Configuración para IA local
-AI_PROVIDER = os.getenv("AI_PROVIDER", "ollama")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+# Configuración para OpenAI
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY no definida en .env")
+
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 
 # ---------------------------------------------------
 # DIRECTORIOS
@@ -101,8 +103,8 @@ class ProjectStatus(BaseModel):
     status: str
     progress: int
     message: str
-    error: Optional[str] = None  # Campo opcional con valor por defecto
-    result: Optional[dict] = None  # Campo opcional con valor por defecto
+    error: Optional[str] = None
+    result: Optional[dict] = None
 
 # ---------------------------------------------------
 # ALMACENAMIENTO DE ESTADO
@@ -183,26 +185,49 @@ def generate_fallback_hooks(product_name: str, num_hooks: int = 3) -> List[str]:
     return random.sample(templates, min(num_hooks, len(templates)))
 
 async def generate_product_hooks(product_name: str, num_hooks: int = 3) -> List[str]:
-    if AI_PROVIDER == "ollama":
-        try:
-            response = requests.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": f"Genera {num_hooks} frases promocionales para '{product_name}'",
-                    "stream": False,
-                    "options": {"temperature": 0.7}
-                },
-                timeout=30
-            )
-            if response.status_code == 200:
-                content = response.json().get("response", "").strip()
-                hooks = [hook.strip() for hook in content.split("|") if hook.strip()]
-                return hooks[:num_hooks] if len(hooks) >= num_hooks else generate_fallback_hooks(product_name, num_hooks)
-        except Exception as e:
-            logger.error(f"Error con Ollama: {str(e)}")
-    
-    return generate_fallback_hooks(product_name, num_hooks)
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        prompt = f"""
+        Genera {num_hooks} frases promocionales creativas para el producto '{product_name}'.
+        Cada frase debe ser atractiva, concisa (máximo 10 palabras) y destacar beneficios únicos.
+        Devuelve las frases separadas por el carácter '|'.
+        
+        Ejemplo:
+        Descubre {product_name} y cambia tu vida|{product_name} - calidad que se nota|Oferta especial: {product_name} con 30% de descuento
+        """
+        
+        data = {
+            "model": OPENAI_MODEL,
+            "messages": [
+                {"role": "system", "content": "Eres un experto en marketing digital que genera frases promocionales efectivas."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 150
+        }
+        
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=data,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            content = response.json()["choices"][0]["message"]["content"].strip()
+            hooks = [hook.strip() for hook in content.split("|") if hook.strip()]
+            return hooks[:num_hooks] if len(hooks) >= num_hooks else generate_fallback_hooks(product_name, num_hooks)
+        
+        logger.error(f"Error con OpenAI: {response.status_code} - {response.text}")
+        return generate_fallback_hooks(product_name, num_hooks)
+        
+    except Exception as e:
+        logger.error(f"Error con OpenAI: {str(e)}")
+        return generate_fallback_hooks(product_name, num_hooks)
 
 def create_subtitle_clip(text: str, duration: float, video_size: tuple) -> TextClip:
     try:
@@ -431,224 +456,6 @@ async def process_all_videos_combinations(file_paths: List[str], product_name: s
             "error",
             0,
             "Falló la generación de combinaciones",
-            error=str(e)
-        )
-        
-async def process_combinations(file_paths: List[str], product_name: str, combinations: int, project_id: str):
-    """Procesa combinaciones de videos según el número solicitado"""
-    try:
-        update_project_state(project_id, "validating", 5, "Validando archivos...")
-
-        # Normaliza rutas y verifica archivos
-        normalized_paths = []
-        for path in file_paths:
-            if path.startswith('uploads/'):
-                path = path[8:]
-            full_path = os.path.join(UPLOAD_DIR, path)
-            if not os.path.exists(full_path):
-                logger.error(f"Archivo no encontrado: {full_path}")
-                continue
-            normalized_paths.append(full_path)
-
-        if len(normalized_paths) < 2:
-            raise Exception("Se necesitan al menos 2 videos válidos para combinaciones")
-
-        # Genera hooks promocionales (el doble de los necesarios)
-        hooks = await generate_product_hooks(product_name, len(normalized_paths)*2)
-        base_filename = generate_unique_filename(product_name).replace(".mp4", "")
-        results = []
-        used_combinations = set()
-
-        # 1. Primero generamos todas las combinaciones secuenciales posibles
-        sequential_combinations = []
-        for i in range(len(normalized_paths)-1):
-            seq_combo = (i, i+1)
-            sequential_combinations.append(seq_combo)
-            used_combinations.add(seq_combo)
-
-        # 2. Generamos las combinaciones solicitadas
-        for combo_num in range(combinations):
-            try:
-                progress = 20 + (combo_num * 70 // combinations)
-                
-                # Si hay combinaciones secuenciales disponibles, las usamos primero
-                if combo_num < len(sequential_combinations):
-                    i, j = sequential_combinations[combo_num]
-                    combo_type = "secuencial"
-                    update_msg = f"Procesando combinación {combo_num+1}/{combinations} ({combo_type}: video {i+1}+{j+1})"
-                else:
-                    # Generamos combinaciones aleatorias únicas
-                    while True:
-                        i, j = random.sample(range(len(normalized_paths)), 2)
-                        if (i, j) not in used_combinations and i != j:
-                            used_combinations.add((i, j))
-                            break
-                    combo_type = "aleatoria"
-                    update_msg = f"Procesando combinación {combo_num+1}/{combinations} ({combo_type}: video {i+1}+{j+1})"
-
-                update_project_state(
-                    project_id,
-                    "processing",
-                    progress,
-                    update_msg
-                )
-
-                # Procesamos los dos videos seleccionados
-                clip1 = VideoFileClip(normalized_paths[i])
-                clip2 = VideoFileClip(normalized_paths[j])
-                
-                # Subtítulos diferentes para cada video
-                subtitle1 = create_subtitle_clip(
-                    f"Beneficio clave {combo_num+1}",
-                    clip1.duration,
-                    clip1.size
-                )
-                subtitle2 = create_subtitle_clip(
-                    hooks[combo_num % len(hooks)],
-                    clip2.duration,
-                    clip2.size
-                )
-                
-                composite1 = CompositeVideoClip([clip1, subtitle1])
-                composite2 = CompositeVideoClip([clip2, subtitle2])
-                final_clip = concatenate_videoclips([composite1, composite2])
-                
-                # Nombre del archivo basado en el tipo de combinación
-                output_filename = f"{base_filename}_{combo_type[:3]}{combo_num+1}.mp4"
-                output_path = os.path.join(RESULT_DIR, output_filename)
-                
-                final_clip.write_videofile(
-                    output_path,
-                    codec="libx264",
-                    audio_codec="aac",
-                    threads=4,
-                    preset="slow",
-                    ffmpeg_params=["-crf", "18"],
-                    verbose=False
-                )
-
-                # Generar thumbnail
-                thumbnail_filename = f"{base_filename}_{combo_type[:3]}{combo_num+1}.jpg"
-                thumbnail_path = os.path.join(THUMBNAIL_DIR, thumbnail_filename)
-                generate_thumbnail(output_path, thumbnail_path)
-                
-                results.append({
-                    "filename": output_filename,
-                    "thumbnail": thumbnail_filename,
-                    "type": combo_type,
-                    "videos": [i+1, j+1]
-                })
-
-                # Liberar recursos
-                composite1.close()
-                composite2.close()
-                final_clip.close()
-                clip1.close()
-                clip2.close()
-
-            except Exception as e:
-                logger.error(f"Error en combinación {combo_num+1}: {str(e)}")
-                continue
-
-        update_project_state(
-            project_id,
-            "completed",
-            100,
-            f"Generadas {len(results)} combinaciones solicitadas",
-            result={
-                "output_files": [item["filename"] for item in results],
-                "thumbnails": [item["thumbnail"] for item in results],
-                "details": results
-            }
-        )
-
-    except Exception as e:
-        logger.error(f"Error crítico: {str(e)}")
-        update_project_state(
-            project_id,
-            "error",
-            0,
-            "Falló la generación de combinaciones",
-            error=str(e)
-        )
-
-async def process_videos_background(file_paths: List[str], product_name: str, combinations: int, project_id: str):
-    try:
-        update_project_state(project_id, "validating", 5, "Validando archivos...")
-        
-        hooks = await generate_product_hooks(product_name, len(file_paths))
-        base_filename = generate_unique_filename(product_name).replace(".mp4", "")
-        
-        for combo in range(combinations):
-            try:
-                combo_progress = 20 + (combo * 70 // combinations)
-                update_project_state(
-                    project_id,
-                    "processing",
-                    combo_progress,
-                    f"Procesando combinación {combo + 1}/{combinations}"
-                )
-                
-                if combo > 0:
-                    import random
-                    random.shuffle(file_paths)
-                
-                video_clips = []
-                for i, path in enumerate(file_paths):
-                    clip = VideoFileClip(path)
-                    subtitle_clip = create_subtitle_clip(hooks[i % len(hooks)], clip.duration, clip.size)
-                    composite_clip = CompositeVideoClip([clip, subtitle_clip])
-                    video_clips.append(composite_clip)
-                
-                final_clip = concatenate_videoclips(video_clips) if len(video_clips) > 1 else video_clips[0]
-                
-                output_filename = f"{base_filename}_{combo+1}.mp4"
-                output_path = os.path.join(RESULT_DIR, output_filename)
-                
-                final_clip.write_videofile(
-                    output_path,
-                    codec="libx264",
-                    audio_codec="aac",
-                    threads=4,
-                    preset="slow",
-                    ffmpeg_params=["-crf", "18", "-pix_fmt", "yuv420p"],
-                    verbose=False,
-                    logger=None
-                )
-                
-                thumbnail_filename = f"{base_filename}_{combo+1}.jpg"
-                thumbnail_path = os.path.join(THUMBNAIL_DIR, thumbnail_filename)
-                generate_thumbnail(output_path, thumbnail_path)
-                
-                # Cerrar clips para liberar memoria
-                for clip in video_clips:
-                    clip.close()
-                final_clip.close()
-                
-            except Exception as e:
-                logger.error(f"Error en combinación {combo+1}: {str(e)}")
-                continue
-        
-        update_project_state(
-            project_id, 
-            "completed", 
-            100, 
-            "¡Proyecto completado exitosamente!",
-            result={
-                "project_id": project_id,
-                "product_name": product_name,
-                "combinations": combinations,
-                "created_at": datetime.now().isoformat()
-            }
-        )
-        
-    except Exception as e:
-        logger.error(f"Error general en el procesamiento: {str(e)}")
-        update_project_state(
-            project_id,
-            "error",
-            0,
-            "Error en el procesamiento",
             error=str(e)
         )
 
