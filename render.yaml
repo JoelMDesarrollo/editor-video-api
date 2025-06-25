@@ -1,14 +1,15 @@
 services:
   - name: editor-video-api
     env: python
+    pythonVersion: "3.12"  # Usa Python 3.12 que es más estable
     build:
       apt:
         packages:
           - imagemagick
           - ffmpeg
-          - libmagickwand-dev  # Paquete adicional necesario
+          - libmagickwand-dev
     envVars:
       - key: IMAGEMAGICK_BINARY
-        value: /usr/bin/convert  # Ruta explícita al binario
+        value: /usr/bin/convert
       - key: FFMPEG_BINARY
         value: /usr/bin/ffmpeg

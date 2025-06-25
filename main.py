@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import uuid
 import shutil
@@ -37,6 +38,13 @@ change_settings({
     "IMAGEMAGICK_BINARY": "/usr/bin/convert",
     "FFMPEG_BINARY": "/usr/bin/ffmpeg"
 })
+try:
+    from moviepy.editor import VideoFileClip, concatenate_videoclips, CompositeVideoClip
+    from PIL import Image
+    import numpy as np
+except ImportError as e:
+    print(f"Error de importación: {e}")
+    sys.exit(1)
 
 # Configuración de la API
 API_KEY = os.getenv("API_KEY", "12345678")
