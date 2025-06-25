@@ -32,11 +32,17 @@ load_dotenv()
 
 # Configuración de MoviePy
 from moviepy.config import change_settings
+# Cambia esta parte de la configuración de MoviePy
 change_settings({
-    "IMAGEMAGICK_BINARY": r"C:\Program Files\ImageMagick-7.1.1-Q16-HDRI\magick.exe",
+    "IMAGEMAGICK_BINARY": "magick",  # O "convert" dependiendo de la instalación en Render
     "FFMPEG_BINARY": "ffmpeg",
     "OPTIMIZE": True
 })
+# change_settings({
+#     "IMAGEMAGICK_BINARY": r"C:\Program Files\ImageMagick-7.1.1-Q16-HDRI\magick.exe",
+#     "FFMPEG_BINARY": "ffmpeg",
+#     "OPTIMIZE": True
+# })
 
 # Configuración de la API
 API_KEY = os.getenv("API_KEY", "12345678")
