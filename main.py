@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 
 from moviepy.editor import VideoFileClip, concatenate_videoclips, CompositeVideoClip, TextClip
 from PIL import Image
+from moviepy.config import change_settings
 
 # ---------------------------------------------------
 # CONFIGURACIÓN INICIAL
@@ -31,12 +32,10 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Configuración de MoviePy
-from moviepy.config import change_settings
 # Cambia esta parte de la configuración de MoviePy
 change_settings({
-    "IMAGEMAGICK_BINARY": os.getenv("IMAGEMAGICK_BINARY", "convert"),
-    "FFMPEG_BINARY": "ffmpeg",
-    "OPTIMIZE": True
+    "IMAGEMAGICK_BINARY": "/usr/bin/convert",
+    "FFMPEG_BINARY": "/usr/bin/ffmpeg"
 })
 
 # Configuración de la API

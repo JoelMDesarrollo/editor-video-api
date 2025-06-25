@@ -4,5 +4,9 @@ services:
     build:
       apt:
         packages:
-          - imagemagick   # Instala ImageMagick
-          - ffmpeg       # Instala FFmpeg (también necesario)
+          - imagemagick
+          - ffmpeg
+          - libmagickwand-dev  # Paquete adicional necesario
+    envVars:
+      - key: IMAGEMAGICK_BINARY
+        value: /usr/bin/convert  # Ruta explícita al binario
