@@ -10,3 +10,5 @@ services:
     envVars:
       - key: IMAGEMAGICK_BINARY
         value: /usr/bin/convert  # Ruta explícita al binario
+      - key: FFMPEG_BINARY
+        value: /usr/bin/ffmpeg
