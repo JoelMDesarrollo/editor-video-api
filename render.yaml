@@ -1,0 +1,8 @@
+services:
+  - name: editor-video-api
+    env: python
+    build:
+      apt:
+        packages:
+          - imagemagick   # Instala ImageMagick
+          - ffmpeg       # Instala FFmpeg (también necesario)
